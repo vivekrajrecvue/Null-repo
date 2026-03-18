@@ -7,7 +7,7 @@
 
 ## 1. Overview
 
-Our portal runs on **AWS**. Infrastructure is defined as **code (Terraform)** and applied via a **Jenkins pipeline** using **OIDC/assume-role** (no long-lived access keys). This guide explains how that infra is organized so you can:
+Our portal runs on **AWS**. Infrastructure is defined as **code (Terraform)** and applied via a **Jenkins pipeline** using **OIDC/assume-role** (no long-lived access keys). We use **one VPC per environment** (e.g. `dev-vpc`, `qa-vpc`, `prod-vpc`) so each environment is fully isolated. This guide explains how that infra is organized so you can:
 
 - Find where a given resource is defined
 - Understand what you can change vs what needs infra/lead input
@@ -24,15 +24,17 @@ Repository (e.g. recvue-portal-infra or monorepo/infra)
 │   ├── bootstrap/          # One-time: state backend + IAM roles for Jenkins/Terraform
 │   ├── modules/            # Reusable Terraform modules (network, EKS, DB, etc.)
 │   └── envs/
-│       └── dev/            # Dev environment: wires modules together, tfvars, backend
+│       ├── dev/            # Dev environment → dev-vpc + resources
+│       ├── qa/             # QA environment → qa-vpc + resources
+│       └── prod/           # Prod environment → prod-vpc + resources
 ├── Jenkinsfile             # Pipeline: plan → approval → apply
 └── docs/
     └── Infrastructure-Organization-Guide.md   # This document
 ```
 
 - **Bootstrap:** Run once per account/region (state bucket, lock table, Jenkins OIDC + Terraform deployer roles).
-- **Modules:** Building blocks (VPC, EKS, RDS, S3+CloudFront, etc.). No environment-specific values inside.
-- **Envs/dev:** Dev-specific configuration; calls modules and passes variables. This is what the Jenkins pipeline runs against.
+- **Modules:** Building blocks (network/VPC, EKS, RDS, S3+CloudFront, etc.). No environment-specific values inside.
+- **Envs:** Each environment (`dev`, `qa`, `prod`) has its own directory. Each env gets its **own VPC** (e.g. `dev-vpc`, `qa-vpc`, `prod-vpc`). All resources for that env (EKS, RDS, ALB, etc.) live inside that env’s VPC. The Jenkins pipeline runs plan/apply per environment.
 
 ---
 
@@ -40,7 +42,7 @@ Repository (e.g. recvue-portal-infra or monorepo/infra)
 
 | You care about… | Look here |
 |-----------------|-----------|
-| **Networking** (VPC, subnets, NAT, security groups) | `infra/modules/network/` + `infra/envs/dev/main.tf` (module usage) |
+| **Networking** (VPC per env: dev-vpc, qa-vpc, prod-vpc; subnets, NAT, security groups) | `infra/modules/network/` + `infra/envs/<env>/main.tf` (one network module call per env → one VPC per env) |
 | **EKS cluster and node groups** | `infra/modules/eks/` + `infra/envs/dev/main.tf` |
 | **API Gateway / ALB / WAF** | `infra/modules/api_gateway/`, `alb/`, `waf/` + env `main.tf` |
 | **Databases** (PostgreSQL, RDS Proxy, Redis, RabbitMQ) | `infra/modules/rds_postgres/`, `redis/`, `rabbitmq/` + env `main.tf` |
@@ -52,14 +54,16 @@ Repository (e.g. recvue-portal-infra or monorepo/infra)
 
 ---
 
-## 4. Environment Strategy
+## 4. Environment Strategy and VPC-per-Environment
 
 - **Environments** are represented as separate **directories** under `infra/envs/` (e.g. `dev`, `qa`, `prod`).
+- **One VPC per environment:** Each environment has its own dedicated VPC. Naming follows `{env}-vpc` (e.g. `dev-vpc`, `qa-vpc`, `prod-vpc`). All compute, data, and edge resources for that env (EKS, RDS, ElastiCache, ALB, NAT, etc.) are created inside that env’s VPC. There is no sharing of VPCs across environments.
 - Each environment has its own:
+  - **VPC** (e.g. `dev-vpc`, `qa-vpc`, `prod-vpc`) and associated subnets/route tables/NAT
   - **State file** (different `key` in the same or different S3 bucket)
-  - **tfvars** (sizes, counts, feature flags)
+  - **tfvars** (sizes, counts, feature flags, VPC CIDR if needed)
   - **Backend config** (`backend.hcl`) pointing to that state
-- **Dev** is the primary environment for day-to-day development; QA/Prod may use the same modules with different variables.
+- **Dev** is the primary environment for day-to-day development; QA/Prod use the same modules with different variables and their own VPCs.
 
 ---
 
@@ -68,7 +72,7 @@ Repository (e.g. recvue-portal-infra or monorepo/infra)
 - **Reusability:** Modules under `infra/modules/` do not hardcode environment names, account IDs, or region. They receive these via variables.
 - **Naming:** Module names reflect the AWS product or area (e.g. `network`, `eks`, `rds_postgres`). Resource names inside use a `prefix` or `environment` variable so resources are identifiable (e.g. `dev-portal-*`).
 - **State:** Only the **env** (e.g. `infra/envs/dev`) holds state. Modules are not applied standalone; they are called from env `main.tf`.
-- **Outputs:** Modules expose outputs (e.g. VPC ID, subnet IDs, EKS cluster name, RDS endpoint) so other modules or the env can reference them (e.g. RDS module uses VPC from network module).
+- **Outputs:** Modules expose outputs (e.g. VPC ID, subnet IDs, EKS cluster name, RDS endpoint) so other modules or the env can reference them (e.g. RDS module uses the same env’s VPC from the network module). Because each env has its own VPC, those outputs always refer to that env’s VPC (e.g. dev’s state has `dev-vpc` and its subnets).
 
 ---
 
@@ -103,7 +107,8 @@ Developers are not expected to apply Terraform to shared environments; they can 
 
 ## 8. Naming and Tagging
 
-- **Resource naming:** We use a consistent prefix per environment (e.g. `dev-portal-*`). The exact pattern is defined in `infra/envs/dev/terraform.tfvars` (e.g. `name_prefix = "dev-portal"`).
+- **VPC naming:** One VPC per environment, named `{env}-vpc` (e.g. `dev-vpc`, `qa-vpc`, `prod-vpc`). This is set via the network module (e.g. `vpc_name = "dev-vpc"` in that env’s tfvars).
+- **Resource naming:** We use a consistent prefix per environment (e.g. `dev-portal-*`). The exact pattern is defined in `infra/envs/<env>/terraform.tfvars` (e.g. `name_prefix = "dev-portal"`). All resources in an env live in that env’s VPC and can use the same prefix.
 - **Tags:** All resources created by Terraform should carry at least:
   - `Environment` (e.g. dev, qa, prod)
   - `Project` (e.g. recvue-portal)
@@ -129,13 +134,14 @@ Developers and leads do not need direct S3/DynamoDB access for day-to-day work; 
 
 | File / directory | Purpose |
 |------------------|---------|
-| `infra/envs/dev/main.tf` | Composes all modules for dev; data sources and providers if needed |
-| `infra/envs/dev/variables.tf` | Variable declarations for dev |
-| `infra/envs/dev/terraform.tfvars` | Dev-specific values (sizes, counts, names) |
-| `infra/envs/dev/backend.hcl` | S3 bucket, state key, DynamoDB table, region for dev |
-| `infra/envs/dev/providers.tf` | AWS provider (region, assume role) and required Terraform/providers versions |
-| `infra/modules/<name>/` | Reusable Terraform for one area (network, EKS, RDS, etc.) |
-| `Jenkinsfile` | Pipeline: checkout → init → validate → plan → approval → apply |
+| `infra/envs/<env>/main.tf` | Composes all modules for that env; one network module call → one VPC per env (e.g. dev-vpc, qa-vpc, prod-vpc) |
+| `infra/envs/<env>/variables.tf` | Variable declarations for that env |
+| `infra/envs/<env>/terraform.tfvars` | Env-specific values (sizes, counts, names, `vpc_name` / `name_prefix`) |
+| `infra/envs/<env>/backend.hcl` | S3 bucket, state key, DynamoDB table, region for that env |
+| `infra/envs/<env>/providers.tf` | AWS provider (region, assume role) and required Terraform/providers versions |
+| `infra/modules/network/` | Creates one VPC + subnets/NAT/SGs; called once per env → dev-vpc, qa-vpc, prod-vpc |
+| `infra/modules/<name>/` | Other reusable modules (EKS, RDS, etc.); all use the VPC from the same env |
+| `Jenkinsfile` | Pipeline: checkout → init → validate → plan → approval → apply (per env) |
 
 ---
 
@@ -150,9 +156,10 @@ Developers and leads do not need direct S3/DynamoDB access for day-to-day work; 
 ## 12. Summary
 
 - **Infra is code** under `infra/`, applied via **Jenkins** with **no static AWS keys** (OIDC + assume-role).
-- **Bootstrap** = state + IAM for pipelines; **modules** = reusable building blocks; **envs/dev** = dev wiring and config.
+- **One VPC per environment:** Dev, QA, and Prod each have their own VPC (`dev-vpc`, `qa-vpc`, `prod-vpc`). All resources for an env live inside that env’s VPC; there is no VPC sharing across environments.
+- **Bootstrap** = state + IAM for pipelines; **modules** = reusable building blocks; **envs** = one directory per env, each with its own VPC and config.
 - **Change flow:** PR → plan in CI → review → merge → apply in Jenkins after **manual approval**.
 - **Developers** can read this doc, run plan, and propose changes; **leads/DevOps** own review and apply.
-- **Naming and tagging** are consistent so we can find and manage resources by environment and project.
+- **Naming and tagging** are consistent (including `{env}-vpc`) so we can find and manage resources by environment and project.
 
 If something isn’t clear or you need access to run plan locally, ask your Team Lead or DevOps.
