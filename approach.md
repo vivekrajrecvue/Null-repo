@@ -3,19 +3,19 @@
 
 **Audience:** Senior Director  
 **Purpose:** Present viable approaches for secure, credential-free Jenkins-to-cloud (AWS/OCI) deployment pipelines.  
+**Scope:** **Jenkins-only** — all pipelines run in Jenkins; GitHub Actions (or other external CI) are not in use.  
 **Length:** ~3 pages
 
 ---
 
 ## 1. Executive Summary
 
-Jenkins does **not** natively issue OIDC tokens that AWS (or OCI) can trust. To run Terraform or other cloud workloads from Jenkins without long-lived access keys, we must introduce an **identity bridge**: either use Jenkins as an OIDC issuer (with caveats), use an **external OIDC broker** (e.g., Okta, Keycloak), or use **GitHub OIDC** for auth while Jenkins orchestrates execution.
+Jenkins does **not** natively issue OIDC tokens that AWS (or OCI) can trust. With **Jenkins as the only pipeline engine** (no GitHub Actions), we have **two feasible options**: (1) make Jenkins an OIDC issuer and federate to AWS IAM, or (2) use an **external OIDC broker** (e.g. Keycloak, Okta) that issues tokens to Jenkins and is trusted by AWS. Both are feasible; the choice depends on whether Jenkins can be public HTTPS and whether an enterprise IdP is available.
 
 | Option | Approach | Best when |
 |--------|----------|-----------|
-| **1** | Jenkins as OIDC issuer → AWS IAM | Jenkins is already public HTTPS and you accept key/issuer management. |
-| **2** | External OIDC broker (Keycloak/Okta) | You already have an IdP; want clear separation of auth and CI. |
-| **3** | GitHub OIDC + Jenkins | You use GitHub; want AWS-native, low-friction auth and minimal secrets. |
+| **1** | Jenkins as OIDC issuer → AWS IAM | Jenkins is already (or can be) public HTTPS; you accept key/issuer management. |
+| **2** | External OIDC broker (Keycloak/Okta) | You have (or can introduce) an IdP; want Jenkins to stay private and avoid running an OIDC issuer. |
 
 ---
 
@@ -23,7 +23,7 @@ Jenkins does **not** natively issue OIDC tokens that AWS (or OCI) can trust. To 
 
 - **Goal:** Jenkins runs pipelines that deploy to AWS (and/or OCI) using **temporary credentials** (no long-lived keys in Jenkins).
 - **Constraint:** AWS (and OCI) trust **OIDC identity providers**. Jenkins does not act as a standard, AWS-trustable OIDC issuer out of the box.
-- **Implication:** We need one of: (a) make Jenkins an OIDC issuer, (b) use an external IdP that Jenkins and AWS both trust, or (c) use another system (e.g., GitHub Actions) to obtain credentials and pass them to Jenkins.
+- **Implication (Jenkins-only):** We need either (a) make Jenkins an OIDC issuer and have AWS trust it, or (b) use an external IdP that Jenkins calls for tokens and AWS trusts for federation. No GitHub or other external CI is in scope.
 
 ---
 
@@ -83,70 +83,42 @@ Jenkins does **not** natively issue OIDC tokens that AWS (or OCI) can trust. To 
 - **Integration work:** Token request and STS exchange must be implemented and maintained (scripts or plugins).
 - Operational ownership of the IdP and its configuration.
 
-**Verdict:** Strong choice when an enterprise IdP is already in place and you want clear boundaries between identity and CI.
+**Verdict:** Strong choice when an enterprise IdP is already in place (or can be introduced) and you want clear boundaries between identity and CI — **fully feasible with Jenkins-only pipelines.**
 
 ---
 
-### Option 3: GitHub OIDC + Jenkins Orchestration
+### Out of scope: GitHub OIDC
 
-**Idea:** Use **GitHub’s OIDC** (supported natively by AWS) to obtain temporary AWS credentials. Jenkins does not issue or broker OIDC; it either **consumes** credentials produced by GitHub (Method A) or is used only as the **execution engine** while GitHub handles only the auth step (Method B).
-
-**Common setup:**
-
-- **AWS:** Create IAM OIDC provider with issuer `https://token.actions.githubusercontent.com` and IAM role with a trust policy that restricts by repo, branch, and optionally workflow/environment.
-
-**Method A – GitHub does auth; Jenkins consumes credentials**
-
-1. GitHub Action runs (e.g. on push), requests OIDC token from GitHub, exchanges with AWS STS.
-2. Action receives temporary AWS credentials and passes them **securely** to Jenkins (e.g. via parameterized build with credentials or a secure channel).
-3. Jenkins runs Terraform/scripts using those credentials.
-
-**Method B – GitHub does only auth; Jenkins is the execution engine**
-
-1. GitHub Action runs only an “auth” job: get OIDC token → exchange with AWS STS → store credentials in a short-lived store (e.g. Vault, AWS Secrets Manager, or secure parameter).
-2. Same or another job triggers Jenkins (e.g. via API) to run the actual pipeline; Jenkins retrieves the temporary credentials and runs Terraform/scripts.
-
-**Advantages**
-
-- **AWS-native:** GitHub OIDC is well documented and widely used; no custom OIDC issuer.
-- **Minimal secrets:** No long-lived AWS keys in GitHub or Jenkins when done correctly.
-- **Fine-grained trust:** IAM policy can limit which repo/branch/workflow can assume the role.
-- Method B keeps “heavy” execution in Jenkins while centralizing auth in GitHub.
-
-**Disadvantages**
-
-- **GitHub dependency:** Requires GitHub (or similar) in the flow; not suitable if all CI must stay inside Jenkins only.
-- **Secure handoff:** Passing credentials from GitHub to Jenkins must be done carefully (secure parameters, no logging).
-
-**Verdict:** Best when the codebase and workflows already use GitHub and you want the simplest, most maintainable path to credential-free AWS access.
+Using **GitHub Actions** to obtain OIDC tokens and pass credentials to Jenkins is **not in scope** for this brief, as we are standardizing on **Jenkins-only** for pipeline execution. If that constraint changes in the future, GitHub OIDC can be revisited.
 
 ---
 
-## 4. Comparison Summary
+## 4. Comparison Summary (Jenkins-only)
 
-| Criteria | Option 1 (Jenkins OIDC) | Option 2 (External IdP) | Option 3 (GitHub OIDC) |
-|----------|-------------------------|--------------------------|-------------------------|
-| **Jenkins public?** | Yes (required) | No | No |
-| **Extra components** | None | IdP (Keycloak/Okta) | GitHub (Actions) |
-| **Key/cert burden** | High (Jenkins issuer) | In IdP | Low (GitHub-managed) |
-| **Enterprise IdP fit** | Weak | Strong | Depends (GitHub as IdP) |
-| **Implementation effort** | Medium | Medium–High | Low–Medium |
-| **Best for** | Jenkins-centric, public Jenkins | Existing Okta/Keycloak | GitHub-centric workflows |
+| Criteria | Option 1 (Jenkins OIDC) | Option 2 (External IdP) |
+|----------|-------------------------|--------------------------|
+| **Jenkins public?** | Yes (required) | No |
+| **Extra components** | None | IdP (Keycloak/Okta) |
+| **Key/cert burden** | High (Jenkins issuer) | In IdP |
+| **Enterprise IdP fit** | Weak | Strong |
+| **Implementation effort** | Medium | Medium–High |
+| **Feasibility (Jenkins-only)** | Yes | Yes |
+
+**Conclusion:** Both options are **feasible** with Jenkins as the sole pipeline engine. Option 2 is generally preferable when an IdP exists or can be adopted, to avoid exposing Jenkins and managing OIDC issuer lifecycle.
 
 ---
 
 ## 5. Recommendation and Next Steps
 
-- **Default recommendation:** Prefer **Option 3 (GitHub OIDC)** if the organization uses GitHub; it is the most straightforward and keeps long-lived keys out of both GitHub and Jenkins.
-- If GitHub is not in scope, prefer **Option 2 (External OIDC broker)** where an IdP already exists; it keeps auth out of Jenkins and avoids making Jenkins a public OIDC issuer.
-- Choose **Option 1** only when Jenkins must be the sole identity source and you can meet the security and operational requirements (public HTTPS, key rotation, compliance).
+- **With Jenkins-only pipelines:** Prefer **Option 2 (External OIDC broker)** if an IdP (Keycloak, Okta, or similar) is available or can be introduced — no need for Jenkins to be public, and auth stays in a dedicated IdP.
+- Choose **Option 1 (Jenkins as OIDC issuer)** when Jenkins must be the sole identity source, it is (or can be) exposed over public HTTPS, and the organization can own key rotation and OIDC issuer compliance.
 
 **Suggested next steps:**
 
-1. Confirm whether GitHub (or similar) is part of the approved toolchain.
-2. If yes: pilot Option 3 (Method A or B) in one repo; document the credential handoff and IAM trust policy.
-3. If no: validate IdP availability (Keycloak/Okta) and scope Option 2; design the token request and STS exchange flow.
-4. For any option: define ownership (security, platform, development) and document the chosen approach in the organization’s runbooks.
+1. Confirm whether an enterprise IdP (Keycloak, Okta, etc.) is in place or approved for use.
+2. If yes: scope **Option 2** — design the token request and AWS STS exchange in the Jenkins pipeline; create IAM OIDC provider and role for the IdP.
+3. If no (and Jenkins can be public): scope **Option 1** — expose Jenkins over HTTPS, configure OIDC issuer, create AWS IAM OIDC provider and role; establish key/cert rotation.
+4. Define ownership (security, platform, development) and document the chosen approach in runbooks.
 
 ---
 
